@@ -171,6 +171,88 @@ def _open_evaluations(page: Page, timeout_ms: int = 20_000) -> bool:
         return False
 
 
+SET_CELL_JS = """({ index, field, targetDay }) => {
+    const input = document.querySelector(
+        `input.cell-input[data-eval-index="${index}"][data-eval-field="${field}"]`);
+    if (!input) return false;
+    input.value = targetDay;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    if (typeof window.handleInputChange === 'function') {
+        window.handleInputChange(index, field, targetDay);
+    }
+    if (typeof window._evalPendingSave !== 'undefined') {
+        window._evalPendingSave = true;
+    }
+    if (typeof window._flushEvalPendingSave === 'function') {
+        window._flushEvalPendingSave();
+    } else if (typeof window.scheduleEvalSave === 'function') {
+        window.scheduleEvalSave();
+    }
+    return true;
+}"""
+
+SAVE_PENDING_JS = """() => Boolean(window._evalBlurSaveTimer) ||
+    window._evalPendingSave === true"""
+
+
+class _WriteTracker:
+    """Counts non-GET requests so we know when the backend save has finished."""
+
+    def __init__(self, page: Page) -> None:
+        self.page = page
+        self.started = 0
+        self.finished = 0
+        page.on("request", self._on_request)
+        page.on("requestfinished", self._on_done)
+        page.on("requestfailed", self._on_done)
+
+    def _on_request(self, request) -> None:
+        if request.method != "GET":
+            self.started += 1
+
+    def _on_done(self, request) -> None:
+        if request.method != "GET":
+            self.finished += 1
+
+    def close(self) -> None:
+        self.page.remove_listener("request", self._on_request)
+        self.page.remove_listener("requestfinished", self._on_done)
+        self.page.remove_listener("requestfailed", self._on_done)
+
+
+def _wait_for_save(page: Page, tracker: _WriteTracker, max_wait_ms: int = 30_000) -> None:
+    """Wait until the debounced save fired and its HTTP write(s) completed."""
+    page.wait_for_timeout(3000)
+    waited = 3000
+    while waited < max_wait_ms:
+        pending = page.evaluate(SAVE_PENDING_JS)
+        in_flight = tracker.finished < tracker.started
+        if not pending and not in_flight and tracker.started > 0:
+            return
+        page.wait_for_timeout(500)
+        waited += 500
+    logger.warning(
+        "Save not confirmed after %ds (writes started=%d finished=%d)",
+        max_wait_ms // 1000,
+        tracker.started,
+        tracker.finished,
+    )
+
+
+def _hedge_input_value(row, field: str) -> tuple[str, str] | None:
+    """Return (eval_index, current_value) for a hedge cell, or None if absent."""
+    cell_input = row.locator(
+        f'td[data-eval-field="{field}"] input.cell-input'
+    ).first
+    if not cell_input.count():
+        return None
+    return (
+        cell_input.get_attribute("data-eval-index") or "",
+        cell_input.input_value().strip(),
+    )
+
+
 def _update_evaluations(
     page: Page, target_day: str, previous_day: str, timeout_ms: int = 15_000
 ) -> int:
@@ -183,78 +265,66 @@ def _update_evaluations(
         logger.info("No evaluation rows found (empty account).")
         return 0
 
-    updates_made = 0
     hedge_fields = [f"Hedge Result {i}" for i in range(1, 6)]
     inactive_statuses = {"", "pass", "closed", "failed", "—", "-"}
     target = target_day.upper()
     previous = previous_day.upper()
+    updated_cells: list[tuple[str, str]] = []
 
-    for row in rows:
-        status_td = row.locator('td[data-eval-field="Status P1"]').first
-        if not status_td.count():
-            continue
-        status_text = status_td.inner_text().strip()
-        if status_text.lower() in inactive_statuses:
-            continue
-
-        for field in hedge_fields:
-            hedge_td = row.locator(f'td[data-eval-field="{field}"]').first
-            if not hedge_td.count():
+    tracker = _WriteTracker(page)
+    try:
+        for row in rows:
+            status_td = row.locator('td[data-eval-field="Status P1"]').first
+            if not status_td.count():
+                continue
+            status_text = status_td.inner_text().strip()
+            if status_text.lower() in inactive_statuses:
                 continue
 
-            current_val = hedge_td.inner_text().strip()
-            if target in current_val.upper():
-                break
-            if previous not in current_val.upper() and current_val not in {"", "—", "-"}:
-                continue
+            for field in hedge_fields:
+                cell = _hedge_input_value(row, field)
+                if cell is None:
+                    continue
+                eval_index, current_val = cell
+                if target in current_val.upper():
+                    logger.info(
+                        "Row index %s [%s] already %s; skipping.",
+                        eval_index, field, current_val,
+                    )
+                    break
+                if previous not in current_val.upper() and current_val not in {
+                    "", "—", "-"
+                }:
+                    continue
 
-            logger.info(
-                "Updating row '%s' [%s] from '%s' to '%s'",
-                status_text,
-                field,
-                current_val,
-                target_day,
-            )
-            # Clicking the cell runs handleCellClick, which mounts the editor input.
-            hedge_td.click()
-            page.wait_for_timeout(200)
-            input_field = hedge_td.locator("input").first
-            if input_field.count():
-                input_field.fill(target_day)
+                changed = page.evaluate(
+                    SET_CELL_JS,
+                    {"index": eval_index, "field": field, "targetDay": target_day},
+                )
+                if changed:
+                    logger.info(
+                        "Updated row index %s [%s] '%s' -> %s",
+                        eval_index, field, current_val, target_day,
+                    )
+                    updated_cells.append((eval_index, field))
+                else:
+                    logger.warning(
+                        "Row index %s [%s] input not found for update",
+                        eval_index, field,
+                    )
                 page.wait_for_timeout(random.randint(50, 100))
-                input_field.press("Enter")
-            else:
-                page.evaluate(
-                    """([td, val]) => {
-                        td.innerText = val;
-                        td.dispatchEvent(new Event('input', { bubbles: true }));
-                        td.dispatchEvent(new Event('change', { bubbles: true }));
-                    }""",
-                    [hedge_td.element_handle(), target_day],
-                )
-            page.wait_for_timeout(300)
+                break
 
-            if target in hedge_td.inner_text().upper():
-                updates_made += 1
-            else:
-                logger.warning(
-                    "Row '%s' [%s] did not keep the value '%s'",
-                    status_text,
-                    field,
-                    target_day,
-                )
-            break
+        if updated_cells:
+            logger.info(
+                "Persisting %d update(s) to TradeOps backend...", len(updated_cells)
+            )
+            _wait_for_save(page, tracker)
+    finally:
+        tracker.close()
 
-    save_btn = page.locator(
-        'button:has-text("Save"), button:has-text("Save Changes"), '
-        'input[value="Save"]'
-    ).first
-    if save_btn.count() and save_btn.is_visible():
-        save_btn.click()
-        page.wait_for_timeout(1000)
-
-    logger.info("Finished client dashboard with %d update(s).", updates_made)
-    return updates_made
+    logger.info("Finished client dashboard with %d update(s).", len(updated_cells))
+    return len(updated_cells)
 
 
 def _save_error_screenshot(page: Page, client_name: str) -> None:
