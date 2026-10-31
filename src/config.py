@@ -47,7 +47,7 @@ class Settings:
             password=password,
             timezone=timezone,
             login_url=os.getenv(
-                "TRADEOPS_LOGIN_URL", "https://www.tradeopss.com/login"
+                "TRADEOPS_LOGIN_URL", "https://www.tradeopss.com/"
             ).strip(),
             portal_url=os.getenv(
                 "TRADEOPS_PORTAL_URL",

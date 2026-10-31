@@ -25,34 +25,45 @@ class Client:
     url: str
 
 
-def _first_visible(locator: Locator, timeout_ms: int) -> Locator:
-    locator.first.wait_for(state="visible", timeout=timeout_ms)
-    for index in range(locator.count()):
-        candidate = locator.nth(index)
-        if candidate.is_visible():
-            return candidate
-    raise ValueError("Expected form control was not found or visible")
-
-
 def _login(page: Page, settings: Settings) -> None:
-    page.goto(
-        settings.login_url,
-        wait_until="networkidle",
-        timeout=30_000,
+    timeout_ms = settings.action_timeout_ms
+    page.goto(settings.login_url, wait_until="networkidle", timeout=30_000)
+
+    email_input = page.locator(
+        'input[type="email"], input[name*="email" i], '
+        'input[autocomplete="username"], input[placeholder*="email" i], '
+        'input#email, input[type="text"]'
+    ).first
+    email_input.wait_for(state="attached", timeout=timeout_ms)
+    email_input.fill(settings.email)
+
+    # Some login forms reveal the password only after a Next/Continue step.
+    next_btn = page.get_by_role(
+        "button", name=re.compile(r"^(next|continue)$", re.IGNORECASE)
     )
-    email = _first_visible(
-        page.locator(
-            'input[type="email"], input[name*="email" i], '
-            'input[placeholder*="email" i], input[autocomplete="username"], '
-            'input[type="text"]'
-        ),
-        settings.action_timeout_ms,
-    )
-    password = _first_visible(
-        page.locator('input[type="password"]'), settings.action_timeout_ms
-    )
-    email.fill(settings.email)
-    password.fill(settings.password)
+    if next_btn.count() and next_btn.first.is_visible():
+        next_btn.first.click()
+        page.wait_for_timeout(1000)
+
+    password_input = page.locator('input#password, input[type="password"]').first
+    password_input.wait_for(state="attached", timeout=timeout_ms)
+    try:
+        password_input.wait_for(state="visible", timeout=3000)
+        password_input.fill(settings.password)
+    except PlaywrightTimeoutError:
+        # Styled inputs can be classified as hidden; set the value directly.
+        page.evaluate(
+            """(pwd) => {
+                const el = document.querySelector(
+                    'input#password, input[type="password"]');
+                if (el) {
+                    el.value = pwd;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }""",
+            settings.password,
+        )
 
     submit = page.get_by_role(
         "button", name=re.compile(r"log\s*in|sign\s*in|submit", re.IGNORECASE)
@@ -60,9 +71,8 @@ def _login(page: Page, settings: Settings) -> None:
     if submit.count() and submit.first.is_visible():
         submit.first.click()
     else:
-        password.press("Enter")
-    page.wait_for_load_state("networkidle", timeout=30_000)
-    password.wait_for(state="hidden", timeout=settings.action_timeout_ms)
+        password_input.press("Enter")
+    page.wait_for_load_state("networkidle", timeout=timeout_ms)
 
     page.goto(settings.portal_url, wait_until="domcontentloaded")
     page.get_by_text(re.compile(r"open\s+dashboard", re.I)).first.wait_for(
