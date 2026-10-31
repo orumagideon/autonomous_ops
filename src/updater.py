@@ -8,7 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin
 
 from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 
@@ -75,68 +75,33 @@ def _login(page: Page, settings: Settings) -> None:
     page.wait_for_load_state("networkidle", timeout=timeout_ms)
 
     page.goto(settings.portal_url, wait_until="domcontentloaded")
-    page.get_by_text(re.compile(r"open\s+dashboard", re.I)).first.wait_for(
-        state="visible", timeout=settings.action_timeout_ms
-    )
+    page.wait_for_selector("a.client-card", state="visible", timeout=20_000)
     if page.locator('input[type="password"]').count():
         raise RuntimeError("TradeOps login did not complete; a password form remains")
     logger.info("Authenticated and opened the Trader Portal")
 
 
-def _client_links(page: Page, portal_url: str) -> list[Client]:
+def _client_links(page: Page) -> list[Client]:
+    page.wait_for_selector("a.client-card", state="visible", timeout=20_000)
+    cards = page.locator("a.client-card")
     clients: list[Client] = []
     seen_urls: set[str] = set()
-    portal_path = portal_url.rstrip("/")
 
-    for index in range(page.locator("a[href]").count()):
-        anchor = page.locator("a[href]").nth(index)
-        href = anchor.get_attribute("href")
+    for index in range(cards.count()):
+        card = cards.nth(index)
+        href = card.get_attribute("href")
         if not href:
             continue
         absolute_url = urljoin(page.url, href)
-        if absolute_url.split("#", 1)[0].rstrip("/") == portal_path:
-            continue
-        try:
-            anchor_text = anchor.inner_text(timeout=1000).strip()
-        except PlaywrightTimeoutError:
-            anchor_text = ""
-        try:
-            card = anchor.locator(
-                "xpath=ancestor::*[contains(translate(@class,"
-                "'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'card')][1]"
-            )
-            card_text = card.inner_text(timeout=1000).strip() if card.count() else ""
-        except PlaywrightTimeoutError:
-            card_text = ""
-
-        combined_text = f"{anchor_text}\n{card_text}"
-        if not re.search(r"open\s+dashboard|client\s+dashboard", combined_text, re.I):
-            continue
         if absolute_url in seen_urls:
             continue
         seen_urls.add(absolute_url)
-        name = anchor_text
-        if re.search(r"open\s+dashboard|client\s+dashboard", name, re.I):
-            name = next(
-                (
-                    line.strip()
-                    for line in card_text.splitlines()
-                    if line.strip()
-                    and not re.search(
-                        r"open\s+dashboard|client\s+dashboard", line, re.I
-                    )
-                ),
-                "",
-            )
-        clients.append(
-            Client(
-                name=name or absolute_url.rstrip("/").rsplit("/", 1)[-1],
-                url=absolute_url,
-            )
-        )
+        name = unquote(absolute_url.rstrip("/").rsplit("/", 1)[-1])
+        clients.append(Client(name=name, url=absolute_url))
 
     if not clients:
-        raise RuntimeError("No client dashboard links were found on the Trader Portal")
+        raise RuntimeError("No a.client-card links were found on the Trader Portal")
+    logger.info("Discovered %d client accounts to process.", len(clients))
     return clients
 
 
@@ -146,6 +111,8 @@ def _open_evaluations(page: Page, timeout_ms: int) -> bool:
         tab = page.get_by_role("link", name=re.compile("evaluations", re.I))
     if not tab.count():
         tab = page.get_by_role("button", name=re.compile("evaluations", re.I))
+    if not tab.count():
+        tab = page.locator('[data-tab="evaluations"]')
     if tab.count() and tab.first.is_visible():
         tab.first.click()
         page.wait_for_timeout(200)
@@ -311,7 +278,7 @@ def update_clients(
     page.set_default_timeout(settings.action_timeout_ms)
     try:
         _login(page, settings)
-        clients = _client_links(page, settings.portal_url)
+        clients = _client_links(page)
     except Exception:
         logger.exception("Could not sign in or load the client list")
         _save_error_screenshot(page, "portal")
@@ -322,7 +289,7 @@ def update_clients(
     for client in clients:
         try:
             logger.info("Processing client: %s", client.name)
-            page.goto(client.url, wait_until="domcontentloaded")
+            page.goto(client.url, wait_until="networkidle", timeout=20_000)
             total_updated += _update_evaluations(
                 page,
                 client,
