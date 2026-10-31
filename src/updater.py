@@ -15,6 +15,9 @@ from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeout
 from src.config import Settings
 
 logger = logging.getLogger(__name__)
+NAV_TIMEOUT_MS = 60_000
+CARD_WAIT_ATTEMPTS = 3
+FALLBACK_PORTAL_URL = "https://www.tradeopss.com/trader/Gideon%20Oruma"
 ACTIVE_STATUS = re.compile(r"in progress|pending|hit\s*tp|hit\s*sl", re.IGNORECASE)
 HEDGE_HEADER = re.compile(r"^HEDGE\s*RESULT(?:\s*(\d+))?$", re.IGNORECASE)
 
@@ -25,9 +28,40 @@ class Client:
     url: str
 
 
+def _goto_with_retry(page: Page, url: str, attempts: int = 3) -> None:
+    for attempt in range(1, attempts + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            return
+        except PlaywrightTimeoutError:
+            logger.warning("Navigation to %s timed out (%d/%d)", url, attempt, attempts)
+            if attempt == attempts:
+                raise
+            page.wait_for_timeout(2000 * attempt)
+
+
+def _wait_for_client_cards(page: Page, portal_url: str) -> None:
+    """Wait for client cards, reloading the portal with longer waits if it lags."""
+    for attempt in range(1, CARD_WAIT_ATTEMPTS + 1):
+        timeout_ms = NAV_TIMEOUT_MS * attempt
+        try:
+            page.wait_for_selector("a.client-card", state="attached", timeout=timeout_ms)
+            return
+        except PlaywrightTimeoutError:
+            logger.warning(
+                "Client cards not rendered after %ds (attempt %d/%d)",
+                timeout_ms // 1000,
+                attempt,
+                CARD_WAIT_ATTEMPTS,
+            )
+            if attempt == CARD_WAIT_ATTEMPTS:
+                raise
+            _goto_with_retry(page, portal_url)
+
+
 def _login(page: Page, settings: Settings) -> None:
     timeout_ms = settings.action_timeout_ms
-    page.goto(settings.login_url, wait_until="networkidle", timeout=30_000)
+    _goto_with_retry(page, settings.login_url)
 
     email_input = page.locator(
         'input[type="email"], input[name*="email" i], '
@@ -72,17 +106,31 @@ def _login(page: Page, settings: Settings) -> None:
         submit.first.click()
     else:
         password_input.press("Enter")
-    page.wait_for_load_state("networkidle", timeout=timeout_ms)
+    # networkidle never resolves here (persistent connections); give the
+    # session cookies/tokens a moment to register instead.
+    page.wait_for_timeout(4000)
 
-    page.goto(settings.portal_url, wait_until="domcontentloaded")
-    page.wait_for_selector("a.client-card", state="visible", timeout=20_000)
-    if page.locator('input[type="password"]').count():
-        raise RuntimeError("TradeOps login did not complete; a password form remains")
-    logger.info("Authenticated and opened the Trader Portal")
+    target_portal = (
+        getattr(settings, "portal_url", None)
+        or getattr(settings, "dashboard_url", None)
+        or FALLBACK_PORTAL_URL
+    )
+    if "trader" not in page.url:
+        logger.info("Navigating to Trader Portal: %s", target_portal)
+        _goto_with_retry(page, target_portal)
+
+    logger.info("Awaiting client cards to attach to the DOM...")
+    _wait_for_client_cards(page, target_portal)
+    page.wait_for_timeout(2000)
+
+    if page.locator('input[type="password"]').first.is_visible():
+        raise RuntimeError(
+            "TradeOps login did not complete; password field remains visible."
+        )
+    logger.info("Authenticated successfully and opened Trader Portal.")
 
 
 def _client_links(page: Page) -> list[Client]:
-    page.wait_for_selector("a.client-card", state="visible", timeout=20_000)
     cards = page.locator("a.client-card")
     clients: list[Client] = []
     seen_urls: set[str] = set()
@@ -289,7 +337,8 @@ def update_clients(
     for client in clients:
         try:
             logger.info("Processing client: %s", client.name)
-            page.goto(client.url, wait_until="networkidle", timeout=20_000)
+            _goto_with_retry(page, client.url)
+            page.wait_for_timeout(2000)
             total_updated += _update_evaluations(
                 page,
                 client,
@@ -301,6 +350,5 @@ def update_clients(
         except Exception:
             logger.exception("Failed while processing client %s", client.name)
             _save_error_screenshot(page, client.name)
-            page.goto(settings.portal_url, wait_until="domcontentloaded")
     logger.info("Updated %d hedge-result cell(s)", total_updated)
     return total_updated
