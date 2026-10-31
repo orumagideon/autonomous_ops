@@ -25,7 +25,8 @@ class Client:
     url: str
 
 
-def _first_visible(locator: Locator) -> Locator:
+def _first_visible(locator: Locator, timeout_ms: int) -> Locator:
+    locator.first.wait_for(state="visible", timeout=timeout_ms)
     for index in range(locator.count()):
         candidate = locator.nth(index)
         if candidate.is_visible():
@@ -34,14 +35,22 @@ def _first_visible(locator: Locator) -> Locator:
 
 
 def _login(page: Page, settings: Settings) -> None:
-    page.goto(settings.login_url, wait_until="domcontentloaded")
+    page.goto(
+        settings.login_url,
+        wait_until="networkidle",
+        timeout=30_000,
+    )
     email = _first_visible(
         page.locator(
             'input[type="email"], input[name*="email" i], '
-            'input[autocomplete="username"]'
-        )
+            'input[placeholder*="email" i], input[autocomplete="username"], '
+            'input[type="text"]'
+        ),
+        settings.action_timeout_ms,
     )
-    password = _first_visible(page.locator('input[type="password"]'))
+    password = _first_visible(
+        page.locator('input[type="password"]'), settings.action_timeout_ms
+    )
     email.fill(settings.email)
     password.fill(settings.password)
 
@@ -52,6 +61,7 @@ def _login(page: Page, settings: Settings) -> None:
         submit.first.click()
     else:
         password.press("Enter")
+    page.wait_for_load_state("networkidle", timeout=30_000)
     password.wait_for(state="hidden", timeout=settings.action_timeout_ms)
 
     page.goto(settings.portal_url, wait_until="domcontentloaded")
