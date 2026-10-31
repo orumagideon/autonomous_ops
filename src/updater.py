@@ -171,58 +171,68 @@ def _open_evaluations(page: Page, timeout_ms: int = 20_000) -> bool:
         return False
 
 
-DAYS_OF_WEEK = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"]
-HEDGE_FIELDS = [f"Hedge Result {i}" for i in range(1, 6)]
-PLACEHOLDERS = {"", "—", "-"}
+DAYS_OF_WEEK = {"MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"}
 
-SET_CELL_JS = """({ index, field, value }) => {
-    const input = document.querySelector(
-        `input.cell-input[data-eval-index="${index}"][data-eval-field="${field}"]`);
-    if (!input) return false;
-    input.value = value;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    if (typeof window.handleInputChange === 'function') {
-        window.handleInputChange(index, field, value);
+# Scans every hedge input on a row (Evaluation, Funded and Farming phases) and
+# swaps stale weekday names for the target day via the app's own handlers.
+SCAN_ROW_JS = """({ rowIndex, targetDay, daysList }) => {
+    const tr = document.querySelectorAll('table.wide-table tbody tr')[rowIndex];
+    if (!tr) return { updated: 0, actions: [] };
+
+    const hedgeInputs = Array.from(tr.querySelectorAll('input.cell-input')).filter(
+        inp => /hedge/i.test(inp.getAttribute('data-eval-field') || ''));
+
+    const apply = (inp, value) => {
+        const field = inp.getAttribute('data-eval-field');
+        const evalIndex = inp.getAttribute('data-eval-index');
+        inp.value = value;
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+        if (typeof window.handleInputChange === 'function') {
+            window.handleInputChange(evalIndex, field, value);
+        }
+        return { field, evalIndex };
+    };
+
+    let updated = 0;
+    const actions = [];
+    let hasTargetDay = hedgeInputs.some(
+        inp => (inp.value || '').trim().toUpperCase() === targetDay);
+
+    for (const inp of hedgeInputs) {
+        const val = (inp.value || '').trim().toUpperCase();
+        if (daysList.includes(val) && val !== targetDay) {
+            const { field, evalIndex } = apply(inp, targetDay);
+            actions.push(`Replaced '${val}' -> '${targetDay}' in [${field}] (index ${evalIndex})`);
+            updated++;
+            hasTargetDay = true;
+        }
     }
-    if (typeof window._evalPendingSave !== 'undefined') {
-        window._evalPendingSave = true;
+
+    if (!hasTargetDay && hedgeInputs.length > 0) {
+        const statusEl = tr.querySelector('input.cell-input[data-eval-field="Status P1"]') ||
+                         tr.querySelector('td[data-eval-field="Status P1"]');
+        const status = statusEl
+            ? (statusEl.value || statusEl.innerText || '').trim().toLowerCase() : '';
+        if (status && !['pass', 'closed', 'failed', '—', '-'].includes(status)) {
+            const { field, evalIndex } = apply(hedgeInputs[0], targetDay);
+            actions.push(`Initialized '${targetDay}' in [${field}] (index ${evalIndex})`);
+            updated++;
+        }
     }
-    if (typeof window._flushEvalPendingSave === 'function') {
-        window._flushEvalPendingSave();
-    } else if (typeof window.scheduleEvalSave === 'function') {
-        window.scheduleEvalSave();
+
+    if (updated > 0) {
+        if (typeof window._evalPendingSave !== 'undefined') {
+            window._evalPendingSave = true;
+        }
+        if (typeof window._flushEvalPendingSave === 'function') {
+            window._flushEvalPendingSave();
+        } else if (typeof window.scheduleEvalSave === 'function') {
+            window.scheduleEvalSave();
+        }
     }
-    return true;
+    return { updated, actions };
 }"""
-
-
-def _set_cell_value(page: Page, index: str, field: str, new_value: str) -> bool:
-    return bool(
-        page.evaluate(SET_CELL_JS, {"index": index, "field": field, "value": new_value})
-    )
-
-
-def plan_hedge_changes(values: dict[str, str], target_day: str) -> dict[str, str]:
-    """Return {field: new_value} so exactly one hedge cell holds target_day.
-
-    `values` maps hedge field -> current text, for the fields present in the row.
-    An existing day is replaced in place; other day cells are cleared.
-    """
-    target = target_day.upper()
-    day_fields = [f for f, v in values.items() if v.strip().upper() in DAYS_OF_WEEK]
-    if not values:
-        return {}
-    if not day_fields:
-        first = next(iter(values))
-        return {first: target_day}
-
-    keep = next((f for f in day_fields if values[f].strip().upper() == target), day_fields[0])
-    changes = {f: "" for f in day_fields if f != keep}
-    if values[keep].strip().upper() != target:
-        changes[keep] = target_day
-    return changes
-
 
 SAVE_PENDING_JS = """() => Boolean(window._evalBlurSaveTimer) ||
     window._evalPendingSave === true"""
@@ -272,21 +282,6 @@ def _wait_for_save(page: Page, tracker: _WriteTracker, max_wait_ms: int = 30_000
     )
 
 
-def _read_hedge_cells(row) -> tuple[str, dict[str, str]]:
-    """Return the row's eval index and current value of each present hedge input."""
-    values: dict[str, str] = {}
-    eval_index = ""
-    for field in HEDGE_FIELDS:
-        cell_input = row.locator(
-            f'td[data-eval-field="{field}"] input.cell-input'
-        ).first
-        if not cell_input.count():
-            continue
-        eval_index = eval_index or (cell_input.get_attribute("data-eval-index") or "")
-        values[field] = cell_input.input_value().strip()
-    return eval_index, values
-
-
 def _update_evaluations(
     page: Page, target_day: str, previous_day: str, timeout_ms: int = 15_000
 ) -> int:
@@ -294,52 +289,39 @@ def _update_evaluations(
         logger.info("Skipping client on %s: Evaluations table not present.", page.url)
         return 0
 
-    rows = page.locator("table.wide-table tbody tr").all()
-    if not rows:
+    row_count = page.locator("table.wide-table tbody tr").count()
+    if not row_count:
         logger.info("No evaluation rows found (empty account).")
         return 0
 
-    inactive_statuses = {"", "pass", "closed", "failed", "—", "-"}
-    updates_made = 0
+    target = target_day.strip().upper()
+    total_updates = 0
 
     tracker = _WriteTracker(page)
     try:
-        for row in rows:
-            status_td = row.locator('td[data-eval-field="Status P1"]').first
-            if not status_td.count():
-                continue
-            status_text = status_td.inner_text().strip()
-            if status_text.lower() in inactive_statuses:
-                continue
-
-            eval_index, values = _read_hedge_cells(row)
-            changes = plan_hedge_changes(values, target_day)
-            if not changes:
-                logger.info("Row index %s already set to %s.", eval_index, target_day)
-                continue
-
-            for field, new_value in changes.items():
-                if _set_cell_value(page, eval_index, field, new_value):
-                    logger.info(
-                        "Updated row index %s [%s] '%s' -> '%s'",
-                        eval_index, field, values[field], new_value,
-                    )
-                    updates_made += 1
-                else:
-                    logger.warning(
-                        "Row index %s [%s] input not found for update",
-                        eval_index, field,
-                    )
+        for row_index in range(row_count):
+            result = page.evaluate(
+                SCAN_ROW_JS,
+                {
+                    "rowIndex": row_index,
+                    "targetDay": target,
+                    "daysList": sorted(DAYS_OF_WEEK),
+                },
+            )
+            for action in result["actions"]:
+                logger.info(action)
+            total_updates += result["updated"]
+            if result["updated"]:
                 page.wait_for_timeout(random.randint(50, 100))
 
-        if updates_made:
-            logger.info("Persisting %d update(s) to TradeOps backend...", updates_made)
+        if total_updates:
+            logger.info("Persisting %d update(s) to TradeOps backend...", total_updates)
             _wait_for_save(page, tracker)
     finally:
         tracker.close()
 
-    logger.info("Finished client dashboard with %d update(s).", updates_made)
-    return updates_made
+    logger.info("Finished client dashboard with %d update(s).", total_updates)
+    return total_updates
 
 
 def _save_error_screenshot(page: Page, client_name: str) -> None:
