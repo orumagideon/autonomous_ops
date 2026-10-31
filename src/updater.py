@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urljoin
 
-from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from src.config import Settings
 
@@ -18,8 +18,6 @@ logger = logging.getLogger(__name__)
 NAV_TIMEOUT_MS = 60_000
 CARD_WAIT_ATTEMPTS = 3
 FALLBACK_PORTAL_URL = "https://www.tradeopss.com/trader/Gideon%20Oruma"
-ACTIVE_STATUS = re.compile(r"in progress|pending|hit\s*tp|hit\s*sl", re.IGNORECASE)
-HEDGE_HEADER = re.compile(r"^HEDGE\s*RESULT(?:\s*(\d+))?$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -153,159 +151,110 @@ def _client_links(page: Page) -> list[Client]:
     return clients
 
 
-def _open_evaluations(page: Page, timeout_ms: int) -> bool:
-    tab = page.get_by_role("tab", name=re.compile("evaluations", re.I))
-    if not tab.count():
-        tab = page.get_by_role("link", name=re.compile("evaluations", re.I))
-    if not tab.count():
-        tab = page.get_by_role("button", name=re.compile("evaluations", re.I))
-    if not tab.count():
-        tab = page.locator('[data-tab="evaluations"]')
-    if tab.count() and tab.first.is_visible():
-        tab.first.click()
-        page.wait_for_timeout(200)
+def _open_evaluations(page: Page, timeout_ms: int = 20_000) -> bool:
+    eval_btn = page.locator('button.tab-btn:has-text("Evaluations")').first
+    if eval_btn.count() and eval_btn.is_visible():
+        try:
+            eval_btn.click()
+            page.wait_for_timeout(500)
+        except PlaywrightTimeoutError:
+            logger.warning("Could not click the Evaluations tab on %s", page.url)
+
+    table = page.locator("table.wide-table").first
     try:
-        page.locator("table").first.wait_for(state="visible", timeout=timeout_ms)
+        table.wait_for(state="visible", timeout=timeout_ms)
+        return True
     except PlaywrightTimeoutError:
-        body_text = page.locator("body").inner_text().lower()
-        if re.search(r"no evaluations|no accounts|no data|empty", body_text):
-            return False
-        raise RuntimeError("Evaluations table did not appear")
-    return True
-
-
-def _hedge_columns(table: Locator) -> list[tuple[int, int]]:
-    headers = table.locator("thead tr").last.locator("th, td")
-    columns: list[tuple[int, int]] = []
-    for index in range(headers.count()):
-        text = headers.nth(index).inner_text().strip()
-        match = HEDGE_HEADER.fullmatch(text)
-        if match:
-            columns.append((int(match.group(1) or "1"), index))
-    return columns
-
-
-def _cell_value(cell: Locator) -> str:
-    control = cell.locator("input, textarea, select, [contenteditable='true']")
-    if control.count():
-        first = control.first
-        if first.evaluate("(element) => element.tagName.toLowerCase()") == "select":
-            return first.locator("option:checked").inner_text().strip()
-        if first.get_attribute("contenteditable") == "true":
-            return first.inner_text().strip()
-        return first.input_value().strip()
-    return cell.inner_text().strip()
-
-
-def _write_cell(cell: Locator, target_day: str) -> bool:
-    control = cell.locator("input, textarea, select, [contenteditable='true']")
-    if not control.count():
-        cell.click()
-        control = cell.locator("input, textarea, select, [contenteditable='true']")
-    if not control.count():
+        if page.locator("table.wide-table").count() > 0:
+            return True
+        logger.warning("No wide-table found on %s", page.url)
         return False
-
-    field = control.first
-    tag_name = field.evaluate("(element) => element.tagName.toLowerCase()")
-    if tag_name == "select":
-        options = field.locator("option")
-        matching = False
-        for index in range(options.count()):
-            option = options.nth(index)
-            if option.inner_text().strip().upper() == target_day:
-                matching = True
-                break
-        if not matching:
-            return False
-        field.select_option(label=target_day)
-    else:
-        field.fill(target_day)
-    field.press("Enter")
-    field.evaluate("(element) => element.blur()")
-    return True
 
 
 def _update_evaluations(
-    page: Page,
-    client: Client,
-    target_day: str,
-    previous_day: str,
-    timeout_ms: int,
+    page: Page, target_day: str, previous_day: str, timeout_ms: int = 15_000
 ) -> int:
     if not _open_evaluations(page, timeout_ms):
-        logger.info("%s has no evaluation rows; skipping", client.name)
-        return 0
-    tables = page.locator("table")
-    if not tables.count():
-        logger.info("%s has no evaluation rows; skipping", client.name)
+        logger.info("Skipping client on %s: Evaluations table not present.", page.url)
         return 0
 
-    table = tables.first
-    columns = _hedge_columns(table)
-    if not columns:
-        logger.warning("%s has no HEDGE RESULT columns; skipping", client.name)
+    rows = page.locator("table.wide-table tbody tr").all()
+    if not rows:
+        logger.info("No evaluation rows found (empty account).")
         return 0
-    active_column = max(columns)[1]
-    headers = table.locator("thead tr").last.locator("th, td")
-    status_column: int | None = None
-    for index in range(headers.count()):
-        if re.search(r"status", headers.nth(index).inner_text(), re.I):
-            status_column = index
+
+    updates_made = 0
+    hedge_fields = [f"Hedge Result {i}" for i in range(1, 6)]
+    inactive_statuses = {"", "pass", "closed", "failed", "—", "-"}
+    target = target_day.upper()
+    previous = previous_day.upper()
+
+    for row in rows:
+        status_td = row.locator('td[data-eval-field="Status P1"]').first
+        if not status_td.count():
+            continue
+        status_text = status_td.inner_text().strip()
+        if status_text.lower() in inactive_statuses:
+            continue
+
+        for field in hedge_fields:
+            hedge_td = row.locator(f'td[data-eval-field="{field}"]').first
+            if not hedge_td.count():
+                continue
+
+            current_val = hedge_td.inner_text().strip()
+            if target in current_val.upper():
+                break
+            if previous not in current_val.upper() and current_val not in {"", "—", "-"}:
+                continue
+
+            logger.info(
+                "Updating row '%s' [%s] from '%s' to '%s'",
+                status_text,
+                field,
+                current_val,
+                target_day,
+            )
+            # Clicking the cell runs handleCellClick, which mounts the editor input.
+            hedge_td.click()
+            page.wait_for_timeout(200)
+            input_field = hedge_td.locator("input").first
+            if input_field.count():
+                input_field.fill(target_day)
+                page.wait_for_timeout(random.randint(50, 100))
+                input_field.press("Enter")
+            else:
+                page.evaluate(
+                    """([td, val]) => {
+                        td.innerText = val;
+                        td.dispatchEvent(new Event('input', { bubbles: true }));
+                        td.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""",
+                    [hedge_td.element_handle(), target_day],
+                )
+            page.wait_for_timeout(300)
+
+            if target in hedge_td.inner_text().upper():
+                updates_made += 1
+            else:
+                logger.warning(
+                    "Row '%s' [%s] did not keep the value '%s'",
+                    status_text,
+                    field,
+                    target_day,
+                )
             break
 
-    rows = table.locator("tbody tr")
-    updated = 0
-    for row_index in range(rows.count()):
-        row = rows.nth(row_index)
-        cells = row.locator("td")
-        if cells.count() <= active_column:
-            continue
-        row_text = row.inner_text().strip()
-        if not row_text:
-            continue
-        status_text = (
-            cells.nth(status_column).inner_text().strip()
-            if status_column is not None and cells.count() > status_column
-            else row_text
-        )
-        if not ACTIVE_STATUS.search(status_text):
-            continue
+    save_btn = page.locator(
+        'button:has-text("Save"), button:has-text("Save Changes"), '
+        'input[value="Save"]'
+    ).first
+    if save_btn.count() and save_btn.is_visible():
+        save_btn.click()
+        page.wait_for_timeout(1000)
 
-        cell = cells.nth(active_column)
-        current_value = _cell_value(cell).strip().upper()
-        if current_value == target_day:
-            continue
-        if current_value not in {"", "-", "—", "–", previous_day}:
-            logger.info(
-                "%s row %d has unexpected hedge value %r; leaving it unchanged",
-                client.name,
-                row_index + 1,
-                current_value,
-            )
-            continue
-        if not _write_cell(cell, target_day):
-            logger.warning(
-                "%s row %d hedge cell is not editable; leaving it unchanged",
-                client.name,
-                row_index + 1,
-            )
-            continue
-
-        save_button = page.get_by_role(
-            "button", name=re.compile(r"^save(?: changes)?$", re.I)
-        )
-        if save_button.count() and save_button.first.is_visible():
-            save_button.first.click()
-        time.sleep(random.uniform(0.05, 0.1))
-        if _cell_value(cell).strip().upper() != target_day:
-            raise RuntimeError(
-                f"{client.name} row {row_index + 1}: hedge value did not persist"
-            )
-        updated += 1
-        logger.info(
-            "%s row %d hedge day set to %s", client.name, row_index + 1, target_day
-        )
-    return updated
+    logger.info("Finished client dashboard with %d update(s).", updates_made)
+    return updates_made
 
 
 def _save_error_screenshot(page: Page, client_name: str) -> None:
@@ -340,11 +289,7 @@ def update_clients(
             _goto_with_retry(page, client.url)
             page.wait_for_timeout(2000)
             total_updated += _update_evaluations(
-                page,
-                client,
-                target_day,
-                previous_day,
-                settings.action_timeout_ms,
+                page, target_day, previous_day, settings.action_timeout_ms
             )
             time.sleep(random.uniform(0.05, 0.1))
         except Exception:
