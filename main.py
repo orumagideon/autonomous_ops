@@ -2,6 +2,7 @@
 
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.browser import launch_browser, start_playwright
@@ -29,8 +30,9 @@ def main() -> int:
     browser = None
     try:
         settings = Settings.from_env()
-        target_day = get_target_day(timezone_name=settings.timezone)
-        previous_day = get_previous_trading_day(timezone_name=settings.timezone)
+        now = datetime.now(timezone.utc)
+        target_day = get_target_day(now, timezone_name=settings.timezone)
+        previous_day = get_previous_trading_day(now, timezone_name=settings.timezone)
         logger.info(
             "Starting TradeOps update: previous trading day=%s, target day=%s",
             previous_day,

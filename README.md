@@ -20,17 +20,19 @@ TradeOps account before scheduling it.
 
 ## Schedule
 
-Run just after midnight, Monday through Friday. The target day is the current
-Nairobi trading day (equivalent to advancing the previous calendar day to the
-next weekday); weekends roll forward to Monday.
+Run at midnight, Monday through Saturday, in East Africa Time. On Saturday,
+the previous trading day is Friday and the target day is Monday. Sunday and
+Monday also resolve to Friday and Monday respectively.
 
 ```cron
-1 0 * * 1-5 /home/<user>/autonomous_ops/venv/bin/python /home/<user>/autonomous_ops/main.py >> /home/<user>/autonomous_ops/cron.log 2>&1
+0 0 * * 1-6 /root/autonomous_ops/run.sh
 ```
 
-Replace `<user>` with the Linux account that owns the project. Set the cron
-environment's timezone to `Africa/Nairobi` as well, or keep the application
-timezone configured in `.env`.
+Install this entry in the VPS's root crontab, and ensure the existing
+`/root/autonomous_ops/run.sh` wrapper runs the updater. The wrapper is managed
+on the server and is not included in this repository. Cron must schedule in
+`Africa/Nairobi` (EAT); setting `TIMEZONE` in `.env` controls the application's
+day calculation but does not change the cron daemon's scheduling timezone.
 
 ## Behavior and logs
 
